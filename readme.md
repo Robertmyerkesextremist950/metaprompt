@@ -83,7 +83,7 @@ Combine both in a single command:
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/metaprompt.git
+git clone https://github.com/OpenSpurCom/metaprompt
 cd metaprompt
 npm install
 ```

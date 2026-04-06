@@ -11,12 +11,16 @@ function log(...args) {
   console.log(line);
 }
 
-const MODEL = 'openai/gpt-4o-mini';
+const MODEL = 'anthropic/claude-opus-4-5';
 
-const client = new OpenAI({
-  baseURL: 'https://openrouter.ai/api/v1',
-  apiKey: process.env.OPENROUTER_API_KEY,
-});
+let _client;
+function getClient() {
+  if (!_client) _client = new OpenAI({
+    baseURL: 'https://openrouter.ai/api/v1',
+    apiKey: process.env.OPENROUTER_API_KEY,
+  });
+  return _client;
+}
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -30,6 +34,7 @@ const ExtractContextSchema = z.object({
   reasoning: z.string(),
   relevantMessageIds: z.array(z.number()),
   relevantThreadIds: z.array(z.number()),
+  newThreadName: z.string().nullable(),
 });
 
 const ExtractTargetRewriteSchema = z.object({
@@ -90,11 +95,13 @@ State summary:
 - Threads: ${JSON.stringify(threadIndex)}
 
 Operation types:
-- metaprompt: structural/organizational mutations (create threads, move messages, reorganize)
-- normal: user continues the conversation and expects an assistant reply
-- rewrite: user wants to rewrite, expand, summarize, or rephrase part of an existing message (may reference it by description or by pasting the text)`;
+- metaprompt: structural/organizational mutations — creating threads, moving messages, reorganizing. Use this if the request mentions "new thread", "create a thread", "put this in a thread", or any explicit thread/organizational action.
+- normal: user is asking a question or continuing a conversation and expects an assistant reply. No thread creation or structural change.
+- rewrite: user wants to rewrite, expand, summarize, or rephrase part of an existing message (may reference it by description or by pasting the text).
 
-  const res = await client.chat.completions.create({
+When in doubt between metaprompt and normal: if the request mentions a thread by name or says to put something "in a thread", it is metaprompt.`;
+
+  const res = await getClient().chat.completions.create({
     model: MODEL,
     max_tokens: 512,
     response_format: buildResponseFormat(ClassifySchema),
@@ -115,14 +122,24 @@ async function stepExtractContext(chats, threads, userRequest) {
   log('[step-2 extract-context input]');
 
   const threadIndex = threads.map(({ th_id, name, context }) => ({ th_id, name, context }));
-  const systemPrompt = `You are identifying which messages and threads are relevant to a user request.
+  const systemPrompt = `You are identifying which messages and threads are relevant to a user request, and deciding whether the response should go into a new thread.
 
 Full state:
 ${JSON.stringify({ chats, threads: threadIndex }, null, 2)}
 
-Return the message IDs and thread IDs that are relevant to the user's request. Include IDs that are directly referenced or clearly needed to fulfill the request.`;
+Return the message IDs and thread IDs that are relevant to the user's request. Include IDs that are directly referenced or clearly needed to fulfill the request.
 
-  const res = await client.chat.completions.create({
+Also decide whether the response warrants a new thread. Set newThreadName to a short descriptive name if:
+- The request introduces a distinct new topic not covered by existing threads
+- The expected response will be long or structured (a list, a breakdown, a reference document)
+- The response would feel out of place appended to the current conversation flow
+
+Set newThreadName to null if:
+- The request is a direct follow-up to the current conversation
+- The answer is short or conversational
+- An existing thread already covers this topic`;
+
+  const res = await getClient().chat.completions.create({
     model: MODEL,
     max_tokens: 512,
     response_format: buildResponseFormat(ExtractContextSchema),
@@ -149,9 +166,9 @@ ${JSON.stringify(scopedChats, null, 2)}
 
 The user wants to rewrite or transform part of one of these messages. Identify which message (by id) is the target, and produce the complete new content for that message. Fulfill the user's instruction while preserving any parts of the message not being changed.`;
 
-  const res = await client.chat.completions.create({
+  const res = await getClient().chat.completions.create({
     model: MODEL,
-    max_tokens: 2048,
+    max_tokens: 16000,
     response_format: buildResponseFormat(ExtractTargetRewriteSchema),
     messages: [
       { role: 'system', content: systemPrompt },
@@ -164,18 +181,21 @@ The user wants to rewrite or transform part of one of these messages. Identify w
   return result;
 }
 
-async function stepExtractTargetMetaprompt(threads, step2Result, userRequest) {
+async function stepExtractTargetMetaprompt(chats, threads, step2Result, userRequest) {
+  const scopedChats = chats.filter(m => step2Result.relevantMessageIds.includes(m.id));
   const threadIndex = threads.map(({ th_id, name, context }) => ({ th_id, name, context }));
 
   const systemPrompt = `You are determining the precise targets of a structural state mutation.
 
-Relevant message IDs: ${JSON.stringify(step2Result.relevantMessageIds)}
+Relevant messages:
+${JSON.stringify(scopedChats, null, 2)}
+
 Relevant thread IDs: ${JSON.stringify(step2Result.relevantThreadIds)}
 Thread index: ${JSON.stringify(threadIndex)}
 
 Describe the exact mutation plan: which threads/messages will be created, modified, or deleted.`;
 
-  const res = await client.chat.completions.create({
+  const res = await getClient().chat.completions.create({
     model: MODEL,
     max_tokens: 1024,
     response_format: buildResponseFormat(ExtractTargetMetapromptSchema),
@@ -194,7 +214,7 @@ async function stepExtractTarget(operationType, chats, threads, step2Result, use
   log('[step-3 extract-target input]', { operationType });
 
   if (operationType === 'metaprompt') {
-    return await stepExtractTargetMetaprompt(threads, step2Result, userRequest);
+    return await stepExtractTargetMetaprompt(chats, threads, step2Result, userRequest);
   } else if (operationType === 'rewrite') {
     return await stepExtractTargetRewrite(chats, step2Result, userRequest);
   } else {
@@ -228,7 +248,7 @@ Rules:
 Current state snapshot:
 ${JSON.stringify({ chats, threads }, null, 2)}`;
 
-  const res = await client.chat.completions.create({
+  const res = await getClient().chat.completions.create({
     model: MODEL,
     max_tokens: 2048,
     response_format: buildResponseFormat(GenerateMutationMetapromptSchema),
@@ -247,16 +267,16 @@ ${JSON.stringify({ chats, threads }, null, 2)}`;
   return result;
 }
 
-async function stepGenerateMutationNormal(chats, step2Result, userRequest) {
+async function stepGenerateMutationNormal(chats, threads, step2Result, userRequest, activeThreadId) {
   const nextMsgId = arr => Math.max(...arr.map(m => m.id), 0) + 1;
 
   const history = chats
     .filter(m => step2Result.relevantMessageIds.includes(m.id))
     .map(m => ({ role: m.role, content: m.content }));
 
-  const res = await client.chat.completions.create({
+  const res = await getClient().chat.completions.create({
     model: MODEL,
-    max_tokens: 2048,
+    max_tokens: 16000,
     messages: [
       ...history,
       { role: 'user', content: userRequest }
@@ -267,11 +287,28 @@ async function stepGenerateMutationNormal(chats, step2Result, userRequest) {
     throw new Error(`Model refused: ${res.choices[0].message.refusal}`);
   }
 
-  const content = res.choices[0].message.content;
-  const newMsg = { id: nextMsgId(chats), role: 'assistant', content };
-  chats.push(newMsg);
-  log('[step-4 normal response]', content);
-  return { content };
+  const userMsg = { id: nextMsgId(chats), role: 'user', content: userRequest };
+  chats.push(userMsg);
+  const assistantMsg = { id: nextMsgId(chats), role: 'assistant', content: res.choices[0].message.content };
+  chats.push(assistantMsg);
+
+  const newIds = [userMsg.id, assistantMsg.id];
+
+  if (step2Result.newThreadName) {
+    const nextThId = arr => Math.max(...arr.map(t => t.th_id), 0) + 1;
+    threads.push({ th_id: nextThId(threads), name: step2Result.newThreadName, context: newIds });
+    log('[step-4 new thread created]', step2Result.newThreadName);
+  } else if (activeThreadId != null) {
+    const thread = threads.find(t => t.th_id === activeThreadId);
+    if (thread) {
+      for (const id of newIds) {
+        if (!thread.context.includes(id)) thread.context.push(id);
+      }
+    }
+  }
+
+  log('[step-4 normal response]', assistantMsg.content);
+  return { content: assistantMsg.content };
 }
 
 function stepGenerateMutationRewrite(chats, step3Result) {
@@ -281,21 +318,84 @@ function stepGenerateMutationRewrite(chats, step3Result) {
   log('[step-4 rewrite applied]', { targetMessageId: step3Result.targetMessageId });
 }
 
-async function stepGenerateMutation(operationType, chats, threads, step2Result, step3Result, userRequest) {
+async function stepGenerateMutation(operationType, chats, threads, step2Result, step3Result, userRequest, activeThreadId) {
   log('[step-4 generate-mutation input]', { operationType });
 
   if (operationType === 'metaprompt') {
     return await stepGenerateMutationMetaprompt(chats, threads, step3Result);
   } else if (operationType === 'normal') {
-    return await stepGenerateMutationNormal(chats, step2Result, userRequest);
+    return await stepGenerateMutationNormal(chats, threads, step2Result, userRequest, activeThreadId);
   } else {
     return stepGenerateMutationRewrite(chats, step3Result);
   }
 }
 
+// ─── Context resolution ───────────────────────────────────────────────────────
+
+async function resolveContext(chats, threads, userRequest, activeThreadId, useAiContext) {
+  if (useAiContext) {
+    log('[context] using AI-extracted context from full conversation');
+    return await stepExtractContext(chats, threads, userRequest);
+  }
+  const thread = threads.find(t => t.th_id === activeThreadId);
+  const ids = thread ? thread.context : chats.map(m => m.id);
+  log('[context] using active thread context', ids);
+  return {
+    relevantMessageIds: ids,
+    relevantThreadIds: thread ? [thread.th_id] : [],
+    newThreadName: null,
+  };
+}
+
+// ─── Normal mode (direct, no pipeline) ───────────────────────────────────────
+
+async function runNormal(chats, threads, userRequest, activeThreadId, useAiContext) {
+  log('=== normal start ===');
+  log('[request]', userRequest);
+
+  const nextMsgId = arr => Math.max(...arr.map(m => m.id), 0) + 1;
+  const nextThId  = arr => Math.max(...arr.map(t => t.th_id), 0) + 1;
+
+  const step2 = await resolveContext(chats, threads, userRequest, activeThreadId, useAiContext);
+  const history = chats
+    .filter(m => step2.relevantMessageIds.includes(m.id))
+    .map(m => ({ role: m.role, content: m.content }));
+
+  const res = await getClient().chat.completions.create({
+    model: MODEL,
+    max_tokens: 16000,
+    messages: [...history, { role: 'user', content: userRequest }]
+  });
+
+  if (res.choices[0].message.refusal) throw new Error(`Model refused: ${res.choices[0].message.refusal}`);
+
+  const userMsg = { id: nextMsgId(chats), role: 'user', content: userRequest };
+  chats.push(userMsg);
+  const assistantMsg = { id: nextMsgId(chats), role: 'assistant', content: res.choices[0].message.content };
+  chats.push(assistantMsg);
+
+  const newIds = [userMsg.id, assistantMsg.id];
+
+  if (step2.newThreadName) {
+    threads.push({ th_id: nextThId(threads), name: step2.newThreadName, context: newIds });
+    log('[normal] new thread created', step2.newThreadName);
+  } else {
+    const thread = threads.find(t => t.th_id === activeThreadId);
+    if (thread) {
+      for (const id of newIds) {
+        if (!thread.context.includes(id)) thread.context.push(id);
+      }
+    }
+  }
+
+  log('[normal response]', assistantMsg.content);
+  log('=== normal end ===');
+  return { operationType: 'normal', chats, threads };
+}
+
 // ─── Orchestrator ─────────────────────────────────────────────────────────────
 
-async function runPipeline(chats, threads, userRequest) {
+async function runPipeline(chats, threads, userRequest, activeThreadId, useAiContext) {
   log('=== pipeline start ===');
   log('[request]', userRequest);
   log('[state before]', { chats, threads });
@@ -303,9 +403,9 @@ async function runPipeline(chats, threads, userRequest) {
   const step1 = await stepClassify(chats, threads, userRequest);
   const { operationType } = step1;
 
-  const step2 = await stepExtractContext(chats, threads, userRequest);
+  const step2 = await resolveContext(chats, threads, userRequest, activeThreadId, useAiContext);
   const step3 = await stepExtractTarget(operationType, chats, threads, step2, userRequest);
-  await stepGenerateMutation(operationType, chats, threads, step2, step3, userRequest);
+  await stepGenerateMutation(operationType, chats, threads, step2, step3, userRequest, activeThreadId);
 
   log('[state after]', { chats, threads });
   log('=== pipeline end ===');
@@ -313,12 +413,16 @@ async function runPipeline(chats, threads, userRequest) {
   return { operationType, chats, threads };
 }
 
-async function metaoperate(chats, threads, userRequest) {
-  return runPipeline(chats, threads, userRequest);
+async function metaoperate(chats, threads, userRequest, activeThreadId, isMeta, useAiContext) {
+  if (isMeta) return runPipeline(chats, threads, userRequest, activeThreadId, useAiContext);
+  return runNormal(chats, threads, userRequest, activeThreadId, useAiContext);
 }
+
+module.exports = { metaoperate, log };
 
 // ─── Demos ────────────────────────────────────────────────────────────────────
 
+if (require.main === module) {
 const { chats, threads } = require('./metapromptdata');
 
 log(`[log file] ${logFile}`);
@@ -368,3 +472,4 @@ metaoperate(chats, threads,
   .then(r => { log('[demo6 done]', r); })
   .catch(err => { log('[demo6 error]', err); console.error(err); });
 */
+}

@@ -120,7 +120,8 @@
       user-select: none;
       transition: background 0.1s;
     }
-    .thread-item:hover { background: var(--btn-hover); }
+    .thread-item:hover { background: transparent; }
+    .thread-item.active { background: transparent; color: var(--accent); }
     .thread-item-label { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 
 
@@ -263,50 +264,16 @@
 
     <div id="workspace">
 
-      <!-- SIDEBAR ─────────────────────────────────────────── -->
       <nav id="sidebar">
         <div class="sidebar-label">Threads</div>
-
-        <div id="thread-list">
-          <!--
-            LiveView: for thread <- @threads do
-              active = thread.id == @active_thread.id
-          -->
-
-          <div class="thread-item"
-               phx-click="load_thread" phx-value-id="1">
-            <span class="thread-item-label">Thread 1</span>
-          </div>
-
-          <div class="thread-item"
-               phx-click="load_thread" phx-value-id="2">
-            <span class="thread-item-label">Thread 2</span>
-          </div>
-
-          <div class="thread-item"
-               phx-click="load_thread" phx-value-id="3">
-            <span class="thread-item-label">Thread 3</span>
-          </div>
-
-          <!-- end -->
-        </div>
-
-
+        <div id="thread-list"></div>
       </nav>
 
-      <!-- PANELS ──────────────────────────────────────────── -->
       <div id="panels-area">
-
-        <!--
-          Single panel — always active.
-          LiveView: phx-click="activate_panel" not needed (only one panel).
-        -->
         <div class="panel" id="panel-main">
           <div class="panel-header">
-            <!-- {@active_thread.title} -->
-            <span class="panel-title">Thread 1</span>
+            <span class="panel-title" id="panel-title"></span>
             <div class="panel-actions">
-              <!-- phx-click="toggle_theme" -->
               <button id="theme-btn" aria-label="Toggle theme">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
@@ -316,48 +283,7 @@
           </div>
 
           <div class="panel-body">
-            <!--
-              phx-hook="ScrollManager"
-              phx-update="stream"
-              id must be stable for LiveView streams
-            -->
-            <div class="messages" id="messages-main"
-                 phx-hook="ScrollManager">
-
-              <!--
-                LiveView: for message <- @streams.messages do
-                  role = message.role  ("user" | "assistant")
-              -->
-
-              <div class="msg msg-user">
-                <div class="body">What is the capital of France?</div>
-              </div>
-
-              <div class="msg msg-assistant">
-                <!-- phx-hook="MarkdownRenderer" or pre-rendered HTML from server -->
-                <div class="body">
-                  The capital of France is <strong>Paris</strong>. It has been the country's capital since the 10th century and is home to landmarks such as the Eiffel Tower and the Louvre.
-                </div>
-              </div>
-
-              <div class="msg msg-user">
-                <div class="body">How many people live there?</div>
-              </div>
-
-              <!--
-                Streaming assistant message:
-                  .streaming class present while @streaming == true
-                  phx-hook="StreamReceiver" listens for push_event("token", %{text: t})
-              -->
-              <div class="msg msg-assistant">
-                <div class="body streaming" id="stream-target" phx-hook="StreamReceiver">
-                  Paris has a city population of approximately 2.1 million
-                </div>
-              </div>
-
-              <!-- end -->
-            </div>
-
+            <div class="messages" id="messages-main"></div>
             <button class="scroll-btn" aria-label="Scroll to bottom">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
                 <polyline points="6 9 12 15 18 9"/>
@@ -365,19 +291,13 @@
             </button>
           </div>
         </div>
+      </div>
 
-      </div><!-- /panels-area -->
     </div><!-- /workspace -->
 
-    <!-- INPUT ───────────────────────────────────────────────
-      LiveView: <.form phx-submit="send_message">
-      disabled={@streaming}
-    -->
     <footer>
       <div id="input-wrap">
-        <textarea id="input" rows="1" placeholder="Message…"
-                  name="message"
-                  phx-hook="AutoResize"></textarea>
+        <textarea id="input" rows="1" placeholder="Message… (/meta, /aicontext)"></textarea>
         <button id="send-btn" aria-label="Send">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
             <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/>
@@ -389,17 +309,22 @@
   </div><!-- /app -->
 
   <script>
-    // ── Hooks (stubs — implemented in app.js) ──────────────────
-    //
-    // ScrollManager   — tracks pinned state, shows/hides scroll-btn
-    // StreamReceiver  — handles push_event("token", %{text}) → appends text,
-    //                   then on push_event("stream_done") → renders markdown
-    // AutoResize      — grows textarea up to 200px
-    //
-    // Everything else (threads, history, panel state) lives on the server.
+    // ── State ──────────────────────────────────────────────────
+    let chats = [];
+    let threads = [];
+    let activeThreadId = null;
+    let busy = false;
 
-    // ── Theme toggle (stays client-side) ──────────────────────
-    const themeBtn = document.getElementById('theme-btn');
+    // ── DOM refs ───────────────────────────────────────────────
+    const threadListEl = document.getElementById('thread-list');
+    const messagesEl   = document.getElementById('messages-main');
+    const panelTitleEl = document.getElementById('panel-title');
+    const inputEl      = document.getElementById('input');
+    const sendBtn      = document.getElementById('send-btn');
+    const scrollBtn    = document.querySelector('.scroll-btn');
+    const themeBtn     = document.getElementById('theme-btn');
+
+    // ── Theme ──────────────────────────────────────────────────
     let dark = true;
     themeBtn.addEventListener('click', () => {
       dark = !dark;
@@ -408,16 +333,13 @@
       document.getElementById('hl-light').disabled = dark;
     });
 
-    // ── AutoResize (stays client-side) ────────────────────────
-    const inputEl = document.getElementById('input');
+    // ── AutoResize ─────────────────────────────────────────────
     inputEl.addEventListener('input', () => {
       inputEl.style.height = 'auto';
       inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
     });
 
-    // ── ScrollManager (stays client-side) ─────────────────────
-    const messagesEl = document.getElementById('messages-main');
-    const scrollBtn  = document.querySelector('.scroll-btn');
+    // ── ScrollManager ──────────────────────────────────────────
     let pinned = true;
     messagesEl.addEventListener('scroll', () => {
       const { scrollTop, scrollHeight, clientHeight } = messagesEl;
@@ -428,24 +350,111 @@
       messagesEl.scrollTo({ top: messagesEl.scrollHeight, behavior: 'smooth' })
     );
 
-    // ── StreamReceiver stub ────────────────────────────────────
-    // In LiveView this is a Hook. Pseudocode:
-    //
-    // StreamReceiver = {
-    //   mounted() {
-    //     this.rawText = "";
-    //     this.handleEvent("token", ({ text }) => {
-    //       this.rawText += text;
-    //       this.el.textContent = this.rawText;
-    //       if (pinned) messagesEl.scrollTop = messagesEl.scrollHeight;
-    //     });
-    //     this.handleEvent("stream_done", () => {
-    //       this.el.innerHTML = marked.parse(this.rawText);
-    //       this.el.classList.remove("streaming");
-    //       this.el.querySelectorAll("pre code").forEach(b => hljs.highlightElement(b));
-    //     });
-    //   }
-    // }
+    // ── Render ─────────────────────────────────────────────────
+    function esc(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function renderThreads() {
+      threadListEl.innerHTML = '';
+      threads.forEach(t => {
+        const el = document.createElement('div');
+        el.className = 'thread-item' + (t.th_id === activeThreadId ? ' active' : '');
+        el.innerHTML = `<span class="thread-item-label">${esc(t.name)}</span>`;
+        el.addEventListener('click', () => {
+          activeThreadId = t.th_id;
+          renderThreads();
+          renderMessages();
+        });
+        threadListEl.appendChild(el);
+      });
+    }
+
+    function renderMessages() {
+      const thread = threads.find(t => t.th_id === activeThreadId);
+      panelTitleEl.textContent = thread ? thread.name : 'All messages';
+
+      const ids = thread ? thread.context : chats.map(m => m.id);
+      const visible = chats.filter(m => ids.includes(m.id));
+
+      messagesEl.innerHTML = '';
+      visible.forEach(m => {
+        const wrap = document.createElement('div');
+        wrap.className = `msg msg-${m.role}`;
+        const body = document.createElement('div');
+        body.className = 'body';
+        if (m.role === 'assistant') {
+          body.innerHTML = marked.parse(m.content);
+          body.querySelectorAll('pre code').forEach(b => hljs.highlightElement(b));
+        } else {
+          body.textContent = m.content;
+        }
+        wrap.appendChild(body);
+        messagesEl.appendChild(wrap);
+      });
+
+      if (pinned) messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    // ── API ────────────────────────────────────────────────────
+    async function loadState() {
+      const res = await fetch('/api/state');
+      const data = await res.json();
+      chats = data.chats;
+      threads = data.threads;
+      if (threads.length && activeThreadId === null) activeThreadId = threads[0].th_id;
+      renderThreads();
+      renderMessages();
+    }
+
+    async function sendMessage() {
+      const userRequest = inputEl.value.trim();
+      if (!userRequest || busy) return;
+
+      const prevThreadIds = new Set(threads.map(t => t.th_id));
+
+      busy = true;
+      inputEl.disabled = true;
+      sendBtn.disabled = true;
+
+      try {
+        const res = await fetch('/api/operate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userRequest, activeThreadId }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || res.statusText);
+
+        chats = data.chats;
+        threads = data.threads;
+
+        // Switch to newly created thread if any
+        const newThread = threads.find(t => !prevThreadIds.has(t.th_id));
+        if (newThread) activeThreadId = newThread.th_id;
+
+        inputEl.value = '';
+        inputEl.style.height = 'auto';
+        renderThreads();
+        renderMessages();
+      } catch (err) {
+        alert('Error: ' + err.message);
+      } finally {
+        busy = false;
+        inputEl.disabled = false;
+        sendBtn.disabled = false;
+        inputEl.focus();
+      }
+    }
+
+    // ── Input handlers ─────────────────────────────────────────
+    sendBtn.addEventListener('click', sendMessage);
+    inputEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    });
+
+    // ── Boot ───────────────────────────────────────────────────
+    loadState();
   </script>
 </body>
 </html>

